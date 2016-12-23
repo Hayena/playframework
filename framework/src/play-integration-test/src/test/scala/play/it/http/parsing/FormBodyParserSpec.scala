@@ -1,29 +1,39 @@
+/*
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
+ */
 package play.it.http.parsing
 
+import akka.stream.Materializer
+import akka.stream.scaladsl.Source
+import akka.util.ByteString
+import play.api.Application
 import play.api.data.Form
 import play.api.data.Forms.{ mapping, nonEmptyText, number }
-import play.api.http.Writeable
-import play.api.libs.iteratee.Enumerator
+import play.api.http.{ MimeTypes, Writeable }
+import play.api.i18n.MessagesApi
 import play.api.libs.json.Json
 import play.api.mvc.{ BodyParser, BodyParsers, Result, Results }
 import play.api.test.{ FakeRequest, PlaySpecification, WithApplication }
 
+import scala.collection.JavaConverters._
 import scala.concurrent.Future
 
 class FormBodyParserSpec extends PlaySpecification {
 
   "The form body parser" should {
 
-    def parse[A, B](body: B, bodyParser: BodyParser[A])(implicit W: Writeable[B]): Either[Result, A] = {
-      await(Enumerator(W.transform(body)) |>>>
-        bodyParser(FakeRequest().withHeaders(W.contentType.map(CONTENT_TYPE -> _).toSeq: _*)))
+    def parse[A, B](body: B, bodyParser: BodyParser[A])(implicit writeable: Writeable[B], mat: Materializer): Either[Result, A] = {
+      await(
+        bodyParser(FakeRequest().withHeaders(writeable.contentType.map(CONTENT_TYPE -> _).toSeq: _*))
+          .run(Source.single(writeable.transform(body)))
+      )
     }
 
     case class User(name: String, age: Int)
 
     val userForm = Form(mapping("name" -> nonEmptyText, "age" -> number)(User.apply)(User.unapply))
 
-    "bind JSON requests" in new WithApplication {
+    "bind JSON requests" in new WithApplication() {
       parse(Json.obj("name" -> "Alice", "age" -> 42), BodyParsers.parse.form(userForm)) must beRight(User("Alice", 42))
     }
 
@@ -36,6 +46,8 @@ class FormBodyParserSpec extends PlaySpecification {
     }
 
     "allow users to override the error reporting behaviour" in new WithApplication() {
+      val messagesApi = app.injector.instanceOf[MessagesApi]
+      implicit val messages = messagesApi.preferred(Seq.empty)
       parse(Json.obj("age" -> "Alice"), BodyParsers.parse.form(userForm, onErrors = (form: Form[User]) => Results.BadRequest(form.errorsAsJson))) must beLeft.which { result =>
         result.header.status must equalTo(BAD_REQUEST)
         val json = contentAsJson(Future.successful(result))
@@ -44,6 +56,30 @@ class FormBodyParserSpec extends PlaySpecification {
       }
     }
 
+  }
+
+  "The Java form body parser" should {
+    def javaParserTest(bodyString: String, bodyData: Map[String, Seq[String]], bodyCharset: Option[String] = None)(implicit app: Application): Unit = {
+      val parser = app.injector.instanceOf[play.mvc.BodyParser.FormUrlEncoded]
+      val mat = app.injector.instanceOf[Materializer]
+      val bs = akka.stream.javadsl.Source.single(ByteString.fromString(bodyString, bodyCharset.getOrElse("UTF-8")))
+      val contentType = bodyCharset.fold(MimeTypes.FORM)(charset => s"${MimeTypes.FORM};charset=$charset")
+      val req = new play.mvc.Http.RequestBuilder().header(CONTENT_TYPE, contentType).build()
+      val result = parser(req).run(bs, mat).toCompletableFuture.get
+      result.right.get.asScala.mapValues(_.toSeq) must_== bodyData
+    }
+
+    "parse bodies in UTF-8" in new WithApplication() {
+      val bodyString = "name=%C3%96sten&age=42"
+      val bodyData = Map("name" -> Seq("Östen"), "age" -> Seq("42"))
+      javaParserTest(bodyString, bodyData)
+    }
+
+    "parse bodies in ISO-8859-1" in new WithApplication() {
+      val bodyString = "name=%D6sten&age=42"
+      val bodyData = Map("name" -> Seq("Östen"), "age" -> Seq("42"))
+      javaParserTest(bodyString, bodyData, Some("ISO-8859-1"))
+    }
   }
 
 }

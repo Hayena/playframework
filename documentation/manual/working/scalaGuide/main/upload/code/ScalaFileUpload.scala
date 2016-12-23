@@ -1,25 +1,45 @@
 /*
- * Copyright (C) 2009-2013 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package scalaguide.upload.fileupload {
 
+  import scala.concurrent.ExecutionContext
+  import play.api.inject.guice.GuiceApplicationBuilder
   import play.api.mvc._
   import play.api.test._
   import org.junit.runner.RunWith
   import org.specs2.runner.JUnitRunner
-  import java.io.{FileWriter, FileOutputStream, File}
 
   import controllers._
-  import play.api.libs.Files.TemporaryFile
+  import play.api.libs.Files.{SingletonTemporaryFileCreator, TemporaryFile}
   import play.api.mvc.MultipartFormData.FilePart
+  import java.io.File
+  import java.nio.file.attribute.PosixFilePermission._
+  import java.nio.file.attribute.PosixFilePermissions
+  import java.nio.file.{Files => JFiles, Path, Paths}
+  import java.util
+  import javax.inject._
+
+  import akka.stream.IOResult
+  import akka.stream.scaladsl._
+  import akka.util.ByteString
+  import play.api._
+  import play.api.libs.streams._
+  import play.api.mvc.MultipartFormData.FilePart
+  import play.api.mvc._
+  import play.core.parsers.Multipart.FileInfo
+
+  import scala.concurrent.Future
+
 
   @RunWith(classOf[JUnitRunner])
   class ScalaFileUploadSpec extends PlaySpecification with Controller {
+    import scala.concurrent.ExecutionContext.Implicits.global
 
     "A scala file upload" should {
 
       "upload file" in {
-        val tmpFile = new File("/tmp/picture/tmpformuploaded")
+        val tmpFile = JFiles.createTempFile(null, null)
         writeFile(tmpFile, "hello")
 
         new File("/tmp/picture").mkdirs()
@@ -29,20 +49,21 @@ package scalaguide.upload.fileupload {
         //#upload-file-action
         def upload = Action(parse.multipartFormData) { request =>
           request.body.file("picture").map { picture =>
-            import java.io.File
             val filename = picture.filename
             val contentType = picture.contentType
-            picture.ref.moveTo(new File(s"/tmp/picture/$filename"))
+            picture.ref.moveTo(Paths.get(s"/tmp/picture/$filename"), replace = true)
             Ok("File uploaded")
           }.getOrElse {
             Redirect(routes.Application.index).flashing(
               "error" -> "Missing file")
           }
         }
-        //#upload-file-action
 
+        //#upload-file-action
+        val temporaryFileCreator = SingletonTemporaryFileCreator
+        val tf = temporaryFileCreator.create(tmpFile)
         val request = FakeRequest().withBody(
-          MultipartFormData(Map.empty, Seq(FilePart("picture", "formuploaded", None, TemporaryFile(tmpFile))), Nil, Nil)
+          MultipartFormData(Map.empty, Seq(FilePart("picture", "formuploaded", None, tf)), Nil)
         )
         testAction(upload, request)
 
@@ -51,14 +72,17 @@ package scalaguide.upload.fileupload {
       }
 
       "upload file directly" in {
-        val tmpFile = new File("/tmp/picture/tmpuploaded")
+        val tmpFile = Paths.get("/tmp/picture/tmpuploaded")
         writeFile(tmpFile, "hello")
 
         new File("/tmp/picture").mkdirs()
         val uploaded = new File("/tmp/picture/uploaded")
         uploaded.delete()
 
-        val request = FakeRequest().withBody(TemporaryFile(tmpFile))
+        val temporaryFileCreator = SingletonTemporaryFileCreator
+        val tf = temporaryFileCreator.create(tmpFile)
+
+        val request = FakeRequest().withBody(tf)
         testAction(new controllers.Application().upload, request)
 
         uploaded.delete()
@@ -67,7 +91,7 @@ package scalaguide.upload.fileupload {
     }
 
     def testAction[A](action: Action[A], request: => Request[A] = FakeRequest(), expectedResponse: Int = OK) = {
-      running(FakeApplication(additionalConfiguration = Map("application.secret" -> "pass"))) {
+      running(GuiceApplicationBuilder().build()) {
 
         val result = action(request)
 
@@ -75,23 +99,22 @@ package scalaguide.upload.fileupload {
       }
     }
 
-    def writeFile(file: File, content: String) = {
-      file.getParentFile.mkdirs()
-      val out = new FileWriter(file)
-      try {
-        out.write(content)
-      } finally {
-        out.close()
-      }
+    def writeFile(file: File, content: String): Path = {
+      writeFile(file.toPath, content)
+    }
+
+    def writeFile(path: Path, content: String): Path = {
+      JFiles.write(path, content.getBytes)
     }
 
   }
   package controllers {
-    class Application extends Controller {
+
+    class Application(implicit ec: ExecutionContext) extends Controller {
 
       //#upload-file-directly-action
         def upload = Action(parse.temporaryFile) { request =>
-          request.body.moveTo(new File("/tmp/picture/uploaded"))
+          request.body.moveTo(Paths.get("/tmp/picture/uploaded"), replace = true)
           Ok("File uploaded")
         }
         //#upload-file-directly-action
@@ -99,6 +122,32 @@ package scalaguide.upload.fileupload {
       def index = Action { request =>
         Ok("Upload failed")
       }
+
+      //#upload-file-customparser
+      type FilePartHandler[A] = FileInfo => Accumulator[ByteString, FilePart[A]]
+
+      def handleFilePartAsFile: FilePartHandler[File] = {
+        case FileInfo(partName, filename, contentType) =>
+          val perms = java.util.EnumSet.of(OWNER_READ, OWNER_WRITE)
+          val attr = PosixFilePermissions.asFileAttribute(perms)
+          val path = JFiles.createTempFile("multipartBody", "tempFile", attr)
+          val file = path.toFile
+          val fileSink = FileIO.toPath(path)
+          val accumulator = Accumulator(fileSink)
+          accumulator.map { case IOResult(count, status) =>
+            FilePart(partName, filename, contentType, file)
+          }(ec)
+      }
+
+      def uploadCustom = Action(parse.multipartFormData(handleFilePartAsFile)) { request =>
+        val fileOption = request.body.file("name").map {
+          case FilePart(key, filename, contentType, file) =>
+            file.toPath
+        }
+
+        Ok(s"File uploaded: $fileOption")
+      }
+      //#upload-file-customparser
 
     }
   }

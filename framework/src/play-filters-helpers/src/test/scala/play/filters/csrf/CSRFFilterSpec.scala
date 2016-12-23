@@ -1,24 +1,32 @@
 /*
- * Copyright (C) 2009-2013 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.filters.csrf
 
-import scala.concurrent.Future
-import play.api.libs.ws._
-import play.api.mvc._
+import java.util.concurrent.CompletableFuture
+import javax.inject.Inject
+
+import play.api.ApplicationLoader.Context
+import play.api.http.HttpFilters
+import play.api.inject.DefaultApplicationLifecycle
+import play.api.inject.guice.{ GuiceApplicationBuilder, GuiceApplicationLoader }
 import play.api.libs.json.Json
+import play.api.libs.ws._
+import play.api.mvc.{ DefaultActionBuilder, RequestHeader, Results }
 import play.api.test._
+import play.api.{ Configuration, Environment, Mode }
+import play.core.DefaultWebCommands
+import play.mvc.Http
+
+import scala.concurrent.Future
 import scala.util.Random
-import play.api.libs.Crypto
 
 /**
  * Specs for the global CSRF filter
  */
-object CSRFFilterSpec extends CSRFCommonSpecs {
+class CSRFFilterSpec extends CSRFCommonSpecs {
 
   sequential
-
-  import CSRFConf._
 
   "a CSRF filter also" should {
 
@@ -45,51 +53,74 @@ object CSRFFilterSpec extends CSRFCommonSpecs {
       buildCsrfAddToken()(_.withHeaders(ACCEPT -> "text/html").head())(_.status must_== OK)
     }
 
-    // extra conditions for not doing a check
-    "not check non form bodies" in {
-      buildCsrfCheckRequest(false)(_.post(Json.obj("foo" -> "bar")))(_.status must_== OK)
+    // extra conditions for doing a check
+    "check non form bodies" in {
+      buildCsrfCheckRequest(sendUnauthorizedResult = false)(_.withCookies("foo" -> "bar").post(Json.obj("foo" -> "bar")))(_.status must_== FORBIDDEN)
+    }
+    "check all methods" in {
+      buildCsrfCheckRequest(sendUnauthorizedResult = false)(_.withCookies("foo" -> "bar").delete())(_.status must_== FORBIDDEN)
     }
     "not check safe methods" in {
-      buildCsrfCheckRequest(false)(_.put(Map("foo" -> "bar")))(_.status must_== OK)
+      buildCsrfCheckRequest(sendUnauthorizedResult = false)(_.withCookies("foo" -> "bar").options())(_.status must_== OK)
+    }
+    "not check requests with no cookies" in {
+      buildCsrfCheckRequest(sendUnauthorizedResult = false)(_.post(Map("foo" -> "bar")))(_.status must_== OK)
     }
 
     // other
     "feed the body once a check has been done and passes" in {
-      withServer(Nil) {
-        case _ => CSRFFilter()(Action(
-          _.body.asFormUrlEncoded
-            .flatMap(_.get("foo"))
-            .flatMap(_.headOption)
-            .map(Results.Ok(_))
-            .getOrElse(Results.NotFound)))
-      } {
-        val token = Crypto.generateSignedToken
-        import play.api.Play.current
-        await(WS.url("http://localhost:" + testServerPort).withSession(TokenName -> token)
+      withActionServer(Seq(
+        "play.http.filters" -> classOf[CsrfFilters].getName
+      ))(implicit app => {
+        case _ =>
+          val Action = inject[DefaultActionBuilder]
+          Action (
+            _.body.asFormUrlEncoded
+              .flatMap(_.get("foo"))
+              .flatMap(_.headOption)
+              .map(Results.Ok(_))
+              .getOrElse(Results.NotFound))
+      }){ ws =>
+        val token = crypto.generateSignedToken
+        await(ws.url("http://localhost:" + testServerPort).withSession(TokenName -> token)
           .post(Map("foo" -> "bar", TokenName -> token))).body must_== "bar"
       }
     }
 
-    val notBufferedFakeApp = FakeApplication(
-      additionalConfiguration = Map("application.secret" -> "foobar", "csrf.body.bufferSize" -> "200"),
-      withRoutes = {
-        case _ => CSRFFilter()(Action(
-          _.body.asFormUrlEncoded
-            .flatMap(_.get("foo"))
-            .flatMap(_.headOption)
-            .map(Results.Ok(_))
-            .getOrElse(Results.NotFound)))
-      }
-    )
+    val notBufferedFakeApp = GuiceApplicationBuilder()
+      .configure(
+        "play.crypto.secret" -> "foobar",
+        "play.filters.csrf.body.bufferSize" -> "200",
+        "play.http.filters" -> classOf[CsrfFilters].getName
+      )
+      .appRoutes(implicit app => {
+        case _ => {
+          val Action = inject[DefaultActionBuilder]
+          Action { req =>
+            (for {
+              body <- req.body.asFormUrlEncoded
+              foos <- body.get("foo")
+              foo <- foos.headOption
+              buffereds <- body.get("buffered")
+              buffered <- buffereds.headOption
+            } yield {
+              Results.Ok(foo + " " + buffered)
+            }).getOrElse(Results.NotFound)
+          }
+        }
+      })
+      .build()
 
     "feed a not fully buffered body once a check has been done and passes" in new WithServer(notBufferedFakeApp, testServerPort) {
-      val token = Crypto.generateSignedToken
-      val response = await(WS.url("http://localhost:" + port).withSession(TokenName -> token)
+      val token = crypto.generateSignedToken
+      val ws = inject[WSClient]
+      val response = await(ws.url("http://localhost:" + port).withSession(TokenName -> token)
         .withHeaders(CONTENT_TYPE -> "application/x-www-form-urlencoded")
         .post(
           Seq(
             // Ensure token is first so that it makes it into the buffered part
             TokenName -> token,
+            "buffered" -> "buffer",
             // This value must go over the edge of csrf.body.bufferSize
             "longvalue" -> Random.alphanumeric.take(1024).mkString(""),
             "foo" -> "bar"
@@ -97,82 +128,116 @@ object CSRFFilterSpec extends CSRFCommonSpecs {
         )
       )
       response.status must_== OK
-      response.body must_== "bar"
-    }
-
-    "be possible to instantiate when there is no running application" in {
-      CSRFFilter() must beAnInstanceOf[AnyRef]
+      response.body must_== "bar buffer"
     }
 
     "work with a Java error handler" in {
       def csrfCheckRequest = buildCsrfCheckRequestWithJavaHandler()
       def csrfAddToken = buildCsrfAddToken("csrf.cookie.name" -> "csrf")
-      def generate = Crypto.generateSignedToken
-      def addToken(req: WSRequestHolder, token: String) = req.withCookies("csrf" -> token)
+      def generate = crypto.generateSignedToken
+      def addToken(req: WSRequest, token: String) = req.withCookies("csrf" -> token)
       def getToken(response: WSResponse) = response.cookies.find(_.name.exists(_ == "csrf")).flatMap(_.value)
-      def compareTokens(a: String, b: String) = Crypto.compareSignedTokens(a, b) must beTrue
+      def compareTokens(a: String, b: String) = crypto.compareSignedTokens(a, b) must beTrue
 
       sharedTests(csrfCheckRequest, csrfAddToken, generate, addToken, getToken, compareTokens, UNAUTHORIZED)
     }
 
   }
 
+  "The CSRF module" should {
+    val environment = Environment(new java.io.File("."), getClass.getClassLoader, Mode.Test)
+    def fakeContext = Context(
+      environment,
+      None,
+      new DefaultWebCommands,
+      Configuration.load(environment),
+      new DefaultApplicationLifecycle()
+    )
+    def loader = new GuiceApplicationLoader
+    "allow injecting CSRF filters" in {
+      implicit val app = loader.load(fakeContext)
+      inject[CSRFFilter] must beAnInstanceOf[CSRFFilter]
+    }
+  }
+
   def buildCsrfCheckRequest(sendUnauthorizedResult: Boolean, configuration: (String, String)*) = new CsrfTester {
-    def apply[T](makeRequest: (WSRequestHolder) => Future[WSResponse])(handleResponse: (WSResponse) => T) = withServer(configuration) {
-      case _ => if (sendUnauthorizedResult) {
-        CSRFFilter(errorHandler = new CustomErrorHandler())(Action(Results.Ok))
-      } else {
-        CSRFFilter()(Action(Results.Ok))
+    def apply[T](makeRequest: (WSRequest) => Future[WSResponse])(handleResponse: (WSResponse) => T) = {
+      val config = configuration ++ Seq("play.http.filters" -> classOf[CsrfFilters].getName) ++ {
+        if (sendUnauthorizedResult) Seq("play.filters.csrf.errorHandler" -> classOf[CustomErrorHandler].getName) else Nil
       }
-    } {
-      import play.api.Play.current
-      handleResponse(await(makeRequest(WS.url("http://localhost:" + testServerPort))))
+      withActionServer(config) { implicit app =>
+        {
+          case _ =>
+            val Action = inject[DefaultActionBuilder]
+            Action(Results.Ok)
+        }
+      } { ws =>
+        handleResponse(await(makeRequest(ws.url("http://localhost:" + testServerPort))))
+      }
     }
   }
 
   def buildCsrfCheckRequestWithJavaHandler() = new CsrfTester {
-    def apply[T](makeRequest: (WSRequestHolder) => Future[WSResponse])(handleResponse: (WSResponse) => T) = {
-      withServer(Seq(
-        "csrf.cookie.name" -> "csrf",
-        "csrf.error.handler" -> "play.filters.csrf.JavaErrorHandler"
-      )) {
-        case _ => new CSRFFilter().apply(Action(Results.Ok))
-      } {
-        import play.api.Play.current
-        handleResponse(await(makeRequest(WS.url("http://localhost:" + testServerPort))))
+    def apply[T](makeRequest: (WSRequest) => Future[WSResponse])(handleResponse: (WSResponse) => T) = {
+      withActionServer(Seq(
+        "play.http.filters" -> classOf[CsrfFilters].getName,
+        "play.filters.csrf.cookie.name" -> "csrf",
+        "play.filters.csrf.errorHandler" -> "play.filters.csrf.JavaErrorHandler"
+      )) { implicit app =>
+        {
+          case _ =>
+            val Action = inject[DefaultActionBuilder]
+            Action(Results.Ok)
+        }
+      } { ws =>
+        handleResponse(await(makeRequest(ws.url("http://localhost:" + testServerPort))))
       }
     }
   }
 
   def buildCsrfAddToken(configuration: (String, String)*) = new CsrfTester {
-    def apply[T](makeRequest: (WSRequestHolder) => Future[WSResponse])(handleResponse: (WSResponse) => T) = withServer(configuration) {
-      case _ => CSRFFilter()(Action { implicit req =>
-        CSRF.getToken(req).map { token =>
-          Results.Ok(token.value)
-        } getOrElse Results.NotFound
-      })
-    } {
-      import play.api.Play.current
-      handleResponse(await(makeRequest(WS.url("http://localhost:" + testServerPort))))
+    def apply[T](makeRequest: (WSRequest) => Future[WSResponse])(handleResponse: (WSResponse) => T) = {
+      withActionServer(
+        configuration ++ Seq("play.http.filters" -> classOf[CsrfFilters].getName)
+      ) (implicit app => {
+          case _ =>
+            val Action = inject[DefaultActionBuilder]
+            Action { implicit req =>
+              CSRF.getToken(req).map { token =>
+                Results.Ok(token.value)
+              } getOrElse Results.NotFound
+            }
+        }) { ws =>
+          handleResponse(await(makeRequest(ws.url("http://localhost:" + testServerPort))))
+        }
     }
   }
 
   def buildCsrfAddResponseHeaders(responseHeaders: (String, String)*) = new CsrfTester {
-    def apply[T](makeRequest: (WSRequestHolder) => Future[WSResponse])(handleResponse: (WSResponse) => T) = withServer(Seq.empty) {
-      case _ => CSRFFilter()(Action(Results.Ok.withHeaders(responseHeaders: _*)))
-    } {
-      import play.api.Play.current
-      handleResponse(await(makeRequest(WS.url("http://localhost:" + testServerPort))))
+    def apply[T](makeRequest: (WSRequest) => Future[WSResponse])(handleResponse: (WSResponse) => T) = {
+      withActionServer(
+        Seq("play.http.filters" -> classOf[CsrfFilters].getName)
+      )(implicit app => {
+          case _ =>
+            val Action = inject[DefaultActionBuilder]
+            Action { Results.Ok.withHeaders(responseHeaders: _*) }
+        }){ ws =>
+          handleResponse(await(makeRequest(ws.url("http://localhost:" + testServerPort))))
+        }
     }
   }
 
-  class CustomErrorHandler extends CSRF.ErrorHandler {
-    import play.api.mvc.Results.Unauthorized
-    def handle(req: RequestHeader, msg: String) = Unauthorized(msg)
-  }
+}
+
+class CustomErrorHandler extends CSRF.ErrorHandler {
+  import play.api.mvc.Results.Unauthorized
+  def handle(req: RequestHeader, msg: String) = Future.successful(Unauthorized(msg))
 }
 
 class JavaErrorHandler extends CSRFErrorHandler {
-  def handle(msg: String) = play.mvc.Results.unauthorized()
+  def handle(req: Http.RequestHeader, msg: String) = CompletableFuture.completedFuture(play.mvc.Results.unauthorized())
 }
 
+class CsrfFilters @Inject() (filter: CSRFFilter) extends HttpFilters {
+  def filters = Seq(filter)
+}

@@ -1,21 +1,39 @@
 /*
- * Copyright (C) 2009-2013 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package scalaguide.ws.scalaws
 
+import akka.Done
+import akka.actor.ActorSystem
+import akka.stream.ActorMaterializer
+import org.asynchttpclient.AsyncHttpClientConfig
+
+import play.api.{Mode, Environment}
+import play.api.inject.guice.GuiceApplicationBuilder
+import play.api.libs.ws.ahc._
 import play.api.test._
 
 import java.io._
 
 import org.junit.runner.RunWith
 import org.specs2.runner.JUnitRunner
+import org.specs2.specification.AfterAll
 
 //#dependency
 import javax.inject.Inject
 import scala.concurrent.Future
+import scala.concurrent.duration._
 
 import play.api.mvc._
 import play.api.libs.ws._
+import play.api.http.HttpEntity
+
+import akka.actor.ActorSystem
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl._
+import akka.util.ByteString
+
+import scala.concurrent.ExecutionContext
 
 class Application @Inject() (ws: WSClient) extends Controller {
 
@@ -28,61 +46,74 @@ case class Person(name: String, age: Int)
 // #scalaws-person
 
 /**
- * NOTE: the format here is because we cannot define FakeApplication in a new WithServer at once, as we run into a
+ * NOTE: the format here is because we cannot define a fake application in a new WithServer at once, as we run into a
  * JVM implementation issue.
  */
 @RunWith(classOf[JUnitRunner])
-class ScalaWSSpec extends PlaySpecification with Results {
+class ScalaWSSpec extends PlaySpecification with Results with AfterAll {
 
-  override val concurrentExecutionContext = scala.concurrent.ExecutionContext.global
-  
+  // #scalaws-context-injected
+  // Configure with a custom execution context from akka.dispatchers.lookup()
+  class MyExecutionContext(ec: ExecutionContext)
+  class PersonService @Inject()(ec: MyExecutionContext) {
+    // ...
+  }
+  // #scalaws-context-injected
   val url = s"http://localhost:$testServerPort/"
 
-  // #scalaws-context
-  implicit val context = play.api.libs.concurrent.Execution.Implicits.defaultContext
-  // #scalaws-context
+  val system = ActorSystem()
+  implicit val materializer = ActorMaterializer()(system)
+
+  def afterAll(): Unit = system.terminate()
 
   def withSimpleServer[T](block: WSClient => T): T = withServer {
     case _ => Action(Ok)
   }(block)
 
   def withServer[T](routes: (String, String) => Handler)(block: WSClient => T): T = {
-    val app = FakeApplication(withRoutes = {
+    val app = GuiceApplicationBuilder().routes({
       case (method, path) => routes(method, path)
-    })
+    }).build()
     running(TestServer(testServerPort, app))(block(app.injector.instanceOf[WSClient]))
   }
-  
-  /**
-   * An enumerator that produces a large result.
-   *
-   * In this case, 10 chunks, each containing abcdefghij repeated 100 times.
-   */
-  val largeEnumerator = {
-    val bytes = ("abcdefghij" * 100).getBytes("utf-8")
-    import play.api.libs.iteratee._
-    Enumerator.unfold(10) {
-      case 0 => None
-      case seq => Some((seq - 1, bytes))
+
+  def writeFile(file: File, content: String) = {
+    file.getParentFile.mkdirs()
+    val out = new FileWriter(file)
+    try {
+      out.write(content)
+    } finally {
+      out.close()
     }
   }
 
+  /**
+   * A source that produces a "large" result.
+   *
+   * In this case, 9 chunks, each containing abcdefghij repeated 100 times.
+   */
+  val largeSource: Source[ByteString, _] = {
+    val source = Source.single(ByteString("abcdefghij" * 100))
+    (1 to 9).foldLeft(source){(acc, _) => (acc ++ source)}
+  }
+
   "WS" should {
+    import scala.concurrent.ExecutionContext.Implicits.global
 
     "allow making a request" in withSimpleServer { ws =>
       //#simple-holder
-      val holder: WSRequestHolder = ws.url(url)
+      val request: WSRequest = ws.url(url)
       //#simple-holder
 
       //#complex-holder
-      val complexHolder: WSRequestHolder =
-        holder.withHeaders("Accept" -> "application/json")
-          .withRequestTimeout(10000)
+      val complexRequest: WSRequest =
+        request.withHeaders("Accept" -> "application/json")
+          .withRequestTimeout(10000.millis)
           .withQueryString("search" -> "play")
       //#complex-holder
 
       //#holder-get
-      val futureResponse: Future[WSResponse] = complexHolder.get()
+      val futureResponse: Future[WSResponse] = complexRequest.get()
       //#holder-get
 
       await(futureResponse).status must_== 200
@@ -149,7 +180,7 @@ class ScalaWSSpec extends PlaySpecification with Results {
     "allow setting the request timeout" in withSimpleServer { ws =>
       val response =
         //#request-timeout
-        ws.url(url).withRequestTimeout(5000).get()
+        ws.url(url).withRequestTimeout(5000.millis).get()
         //#request-timeout
 
       await(response).status must_== 200
@@ -158,7 +189,7 @@ class ScalaWSSpec extends PlaySpecification with Results {
     "when posting data" should {
 
       "post with form url encoded body" in withServer {
-        case ("POST", "/") => Action(BodyParsers.parse.urlFormEncoded)(r => Ok(r.body("key").head))
+        case ("POST", "/") => Action(BodyParsers.parse.formUrlEncoded)(r => Ok(r.body("key").head))
       } { ws =>
         val response =
           //#url-encoded
@@ -166,6 +197,36 @@ class ScalaWSSpec extends PlaySpecification with Results {
           //#url-encoded
 
         await(response).body must_== "value"
+      }
+
+      "post with multipart/form encoded body" in withServer {
+          case("POST", "/") => Action(BodyParsers.parse.multipartFormData)(r => Ok(r.body.asFormUrlEncoded("key").head))
+        } { ws =>
+        import play.api.mvc.MultipartFormData._
+        val response =
+        //#multipart-encoded
+        ws.url(url).post(Source.single(DataPart("key", "value")))
+        //#multipart-encoded
+
+        await(response).body must_== "value"
+      }
+
+      "post with multipart/form encoded body from a file" in withServer {
+        case("POST", "/") => Action(BodyParsers.parse.multipartFormData){r =>
+            val file = r.body.file("hello").head
+          Ok(scala.io.Source.fromFile(file.ref).mkString)
+        }
+      } { ws =>
+        val tmpFile = new File("/tmp/picture/tmpformuploaded")
+        writeFile(tmpFile, "world")
+
+        import play.api.mvc.MultipartFormData._
+        val response =
+        //#multipart-encoded2
+        ws.url(url).post(Source(FilePart("hello", "hello.txt", Option("text/plain"), FileIO.fromFile(tmpFile)) :: DataPart("key", "value") :: List()))
+        //#multipart-encoded2
+
+        await(response).body must_== "world"
       }
 
       "post with JSON body" in  withServer {
@@ -261,49 +322,45 @@ class ScalaWSSpec extends PlaySpecification with Results {
       }
 
       "handle as stream" in withServer {
-        case ("GET", "/") => Action(Ok.chunked(largeEnumerator))
+        case ("GET", "/") => Action(Ok.chunked(largeSource))
       } { ws =>
         //#stream-count-bytes
-        import play.api.libs.iteratee._
-
         // Make the request
-        val futureResponse: Future[(WSResponseHeaders, Enumerator[Array[Byte]])] =
-          ws.url(url).getStream()
+        val futureResponse: Future[StreamedResponse] =
+          ws.url(url).withMethod("GET").stream()
 
         val bytesReturned: Future[Long] = futureResponse.flatMap {
-          case (headers, body) =>
+          res =>
             // Count the number of bytes returned
-            body |>>> Iteratee.fold(0l) { (total, bytes) =>
+            res.body.runWith(Sink.fold[Long, ByteString](0L){ (total, bytes) =>
               total + bytes.length
-            }
+            })
         }
         //#stream-count-bytes
         await(bytesReturned) must_== 10000l
       }
 
       "stream to a file" in withServer {
-        case ("GET", "/") => Action(Ok.chunked(largeEnumerator))
+        case ("GET", "/") => Action(Ok.chunked(largeSource))
       } { ws =>
         val file = File.createTempFile("stream-to-file-", ".txt")
         try {
           //#stream-to-file
-          import play.api.libs.iteratee._
-
           // Make the request
-          val futureResponse: Future[(WSResponseHeaders, Enumerator[Array[Byte]])] =
-            ws.url(url).getStream()
+          val futureResponse: Future[StreamedResponse] =
+            ws.url(url).withMethod("GET").stream()
 
           val downloadedFile: Future[File] = futureResponse.flatMap {
-            case (headers, body) =>
+            res =>
               val outputStream = new FileOutputStream(file)
 
-              // The iteratee that writes to the output stream
-              val iteratee = Iteratee.foreach[Array[Byte]] { bytes =>
-                outputStream.write(bytes)
+              // The sink that writes to the output stream
+              val sink = Sink.foreach[ByteString] { bytes =>
+                outputStream.write(bytes.toArray)
               }
 
-              // Feed the body into the iteratee
-              (body |>>> iteratee).andThen {
+              // materialize and run the stream
+              res.body.runWith(sink).andThen {
                 case result =>
                   // Close the output stream whether there was an error or not
                   outputStream.close()
@@ -320,16 +377,14 @@ class ScalaWSSpec extends PlaySpecification with Results {
       }
 
       "stream to a result" in withServer {
-        case ("GET", "/") => Action(Ok.chunked(largeEnumerator))
+        case ("GET", "/") => Action(Ok.chunked(largeSource))
       } { ws =>
-        val file = File.createTempFile("stream-to-file-", ".txt")
-        try {
           //#stream-to-result
           def downloadFile = Action.async {
 
             // Make the request
-            ws.url(url).getStream().map {
-              case (response, body) =>
+            ws.url(url).withMethod("GET").stream().map {
+              case StreamedResponse(response, body) =>
 
                 // Check that the response was successful
                 if (response.status == 200) {
@@ -341,7 +396,7 @@ class ScalaWSSpec extends PlaySpecification with Results {
                   // If there's a content length, send that, otherwise return the body chunked
                   response.headers.get("Content-Length") match {
                     case Some(Seq(length)) =>
-                      Ok.feed(body).as(contentType).withHeaders("Content-Length" -> length)
+                      Ok.sendEntity(HttpEntity.Streamed(body, Some(length.toLong), Some(contentType)))
                     case _ =>
                       Ok.chunked(body).as(contentType)
                   }
@@ -351,35 +406,42 @@ class ScalaWSSpec extends PlaySpecification with Results {
             }
           }
           //#stream-to-result
-          import play.api.libs.iteratee._
+          val file = File.createTempFile("stream-to-file-", ".txt")
           await(
             downloadFile(FakeRequest())
-              .flatMap(_.body &> Results.dechunk |>>> Iteratee.fold(0l)((t, b) => t + b.length))
+              .flatMap(_.body.dataStream.runFold(0l)((t, b) => t + b.length))
           ) must_== 10000l
-
-        } finally {
           file.delete()
-        }
       }
 
       "stream when request is a PUT" in withServer {
-        case ("PUT", "/") => Action(Ok.chunked(largeEnumerator))
+        case ("PUT", "/") => Action(Ok.chunked(largeSource))
       } { ws =>
-        import play.api.libs.iteratee._
-
         //#stream-put
-        val futureResponse: Future[(WSResponseHeaders, Enumerator[Array[Byte]])] =
+        val futureResponse: Future[StreamedResponse] =
           ws.url(url).withMethod("PUT").withBody("some body").stream()
         //#stream-put
 
         val bytesReturned: Future[Long] = futureResponse.flatMap {
-          case (headers, body) =>
-            body |>>> Iteratee.fold(0l) { (total, bytes) =>
+          res =>
+            res.body.runWith(Sink.fold[Long, ByteString](0L){ (total, bytes) =>
               total + bytes.length
-            }
+            })
         }
         //#stream-count-bytes
         await(bytesReturned) must_== 10000l
+      }
+
+
+    "stream request body" in withServer {
+        case ("PUT", "/") => Action(Ok(""))
+      } { ws =>
+        def largeImageFromDB: Source[ByteString, _] = largeSource
+        //#scalaws-stream-request
+        val wsResponse: Future[WSResponse] = ws.url(url)
+          .withBody(StreamedBody(largeImageFromDB)).execute("PUT")
+        //#scalaws-stream-request
+        await(wsResponse).status must_== 200
       }
     }
 
@@ -427,67 +489,28 @@ class ScalaWSSpec extends PlaySpecification with Results {
       //#async-result
     }
 
-    "allow working with clients directly" in withSimpleServer { ws =>
+    "allow simple programmatic configuration" in new WithApplication() {
+      //#simple-ws-custom-client
+      import play.api.libs.ws.ahc._
 
-      //#implicit-client
-      import play.api.libs.ws.ning.NingAsyncHttpClientConfigBuilder
-      import play.api.libs.ws.ning.NingWSClient
-      import com.ning.http.client.AsyncHttpClientConfig
+      // usually injected through @Inject()(implicit mat: Materializer)
+      implicit val mat: akka.stream.Materializer = app.materializer
+      val wsClient = AhcWSClient()
+      //#simple-ws-custom-client
 
-      val clientConfig = new DefaultWSClientConfig()
-      val secureDefaults: AsyncHttpClientConfig = new NingAsyncHttpClientConfigBuilder(clientConfig).build()
-      // You can directly use the builder for specific options once you have secure TLS defaults...
-      val builder = new AsyncHttpClientConfig.Builder(secureDefaults)
-      builder.setCompressionEnabled(true)
-      val secureDefaultsWithSpecificOptions: AsyncHttpClientConfig = builder.build()
-      implicit val sslClient = new NingWSClient(secureDefaultsWithSpecificOptions)
+      wsClient.close()
 
-      val response = WS.clientUrl(url).get()
-      //#implicit-client
-      await(response).status must_== OK
-
-      {
-        //#direct-client
-        val response = sslClient.url(url).get()
-        //#direct-client
-        await(response).status must_== OK
-      }
-
-      sslClient.close()
       ok
-    }
-
-    "allow using pair magnets" in withSimpleServer { ws =>
-      //#pair-magnet
-      object PairMagnet {
-        implicit def fromPair(pair: (WSClient, java.net.URL)) =
-          new WSRequestHolderMagnet {
-            def apply(): WSRequestHolder = {
-              val (client, netUrl) = pair
-              client.url(netUrl.toString)
-            }
-          }
-      }
-
-      import scala.language.implicitConversions
-      import PairMagnet._
-
-      val exampleURL = new java.net.URL(url)
-      val response = WS.url(ws -> exampleURL).get()
-      //#pair-magnet
-
-      await(response).status must_== OK
     }
 
     "allow programmatic configuration" in new WithApplication() {
 
-      //#programmatic-config
+      //#ws-custom-client
       import com.typesafe.config.ConfigFactory
       import play.api._
       import play.api.libs.ws._
-      import play.api.libs.ws.ning._
 
-      val configuration = play.api.Configuration(ConfigFactory.parseString(
+      val configuration = Configuration.reference ++ Configuration(ConfigFactory.parseString(
         """
           |ws.followRedirects = true
         """.stripMargin))
@@ -495,16 +518,30 @@ class ScalaWSSpec extends PlaySpecification with Results {
       // If running in Play, environment should be injected
       val environment = Environment(new File("."), this.getClass.getClassLoader, Mode.Prod)
 
-      val parser = new DefaultWSConfigParser(configuration, environment)
-      val builder = new NingAsyncHttpClientConfigBuilder(parser.parse())
-      //#programmatic-config
+      val parser = new WSConfigParser(configuration, environment)
+      val config = new AhcWSClientConfig(wsClientConfig = parser.parse())
+      val builder = new AhcConfigBuilder(config)
+      val logging = new AsyncHttpClientConfig.AdditionalChannelInitializer() {
+        override def initChannel(channel: io.netty.channel.Channel): Unit = {
+          channel.pipeline.addFirst("log", new io.netty.handler.logging.LoggingHandler("debug"))
+        }
+      }
+      val ahcBuilder = builder.configure()
+      ahcBuilder.setHttpAdditionalChannelInitializer(logging)
+      val ahcConfig = ahcBuilder.build()
+      val wsClient = new AhcWSClient(ahcConfig)
+      //#ws-custom-client
+
+      //#close-client
+      wsClient.close()
+      //#close-client
 
       ok
     }
 
     "grant access to the underlying client" in withSimpleServer { ws =>
       //#underlying
-      import com.ning.http.client.AsyncHttpClient
+      import org.asynchttpclient.AsyncHttpClient
 
       val client: AsyncHttpClient = ws.underlying
       //#underlying
@@ -512,7 +549,15 @@ class ScalaWSSpec extends PlaySpecification with Results {
       ok
     }
 
+    "use logging" in withSimpleServer { ws =>
+      // #curl-logger-filter
+      ws.url(s"http://localhost:$testServerPort")
+        .withRequestFilter(AhcCurlRequestLogger())
+        .put(Map("key" -> Seq("value")))
+      // #curl-logger-filter
+
+      ok
+    }
+
   }
 }
-
-

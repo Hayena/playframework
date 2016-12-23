@@ -1,42 +1,47 @@
 /*
- * Copyright (C) 2009-2013 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.api.test
 
-import scala.language.reflectiveCalls
-
-import play.api._
-import play.api.mvc._
-import play.api.http._
-
-import play.api.libs.iteratee._
-import play.api.libs.json.{ Json, JsValue }
-
-import play.twirl.api.Content
-
+import akka.actor.Cancellable
+import akka.stream.scaladsl.Source
+import akka.stream._
+import akka.util.{ ByteString, Timeout }
 import org.openqa.selenium._
 import org.openqa.selenium.firefox._
 import org.openqa.selenium.htmlunit._
+import play.api._
+import play.api.http._
+import play.api.inject.guice.GuiceApplicationBuilder
+import play.api.libs.json.{ JsValue, Json }
+import play.api.libs.streams.Accumulator
+import play.api.mvc._
+import play.mvc.Http.RequestBody
+import play.twirl.api.Content
 
-import scala.concurrent.Await
+import scala.concurrent.{ Await, Future }
+import scala.concurrent.ExecutionContextExecutor
 import scala.concurrent.duration._
-
-import scala.concurrent.Future
-import akka.util.Timeout
+import scala.language.reflectiveCalls
+import scala.reflect.ClassTag
 
 /**
  * Helper functions to run tests.
  */
-trait PlayRunners {
-
-  val GET = "GET"
-  val POST = "POST"
-  val PUT = "PUT"
-  val DELETE = "DELETE"
-  val HEAD = "HEAD"
+trait PlayRunners extends HttpVerbs {
 
   val HTMLUNIT = classOf[HtmlUnitDriver]
   val FIREFOX = classOf[FirefoxDriver]
+
+  /**
+   * The base builder used in the running method.
+   */
+  lazy val baseApplicationBuilder = new GuiceApplicationBuilder()
+
+  def running[T]()(block: Application => T): T = {
+    val app = baseApplicationBuilder.build()
+    running(app)(block(app))
+  }
 
   /**
    * Executes a block of code in a running application.
@@ -50,6 +55,11 @@ trait PlayRunners {
         Play.stop(app)
       }
     }
+  }
+
+  def running[T](builder: GuiceApplicationBuilder => GuiceApplicationBuilder)(block: Application => T): T = {
+    val app = builder(baseApplicationBuilder).build()
+    running(app)(block(app))
   }
 
   /**
@@ -99,7 +109,7 @@ trait PlayRunners {
   lazy val testServerPort = Option(System.getProperty("testserver.port")).map(_.toInt).getOrElse(19001)
 
   /**
-   * Constructs a in-memory (h2) database configuration to add to a FakeApplication.
+   * Constructs a in-memory (h2) database configuration to add to an Application.
    */
   def inMemoryDatabase(name: String = "default", options: Map[String, String] = Map.empty[String, String]): Map[String, String] = {
     val optionsForDbUrl = options.map { case (k, v) => k + "=" + v }.mkString(";", ";", "")
@@ -136,7 +146,7 @@ trait Writeables {
     Writeable.wString.map(c => c.txt)
 
   implicit def writeableOf_AnyContentAsEmpty(implicit code: Codec): Writeable[AnyContentAsEmpty.type] =
-    Writeable(_ => Array.empty[Byte], None)
+    Writeable(_ => ByteString.empty, None)
 }
 
 trait DefaultAwaitTimeout {
@@ -190,25 +200,25 @@ trait EssentialActionCaller {
   /**
    * Execute an [[play.api.mvc.EssentialAction]].
    *
-   * The body is serialised using the implicit writable, so that the action body parser can deserialise it.
+   * The body is serialised using the implicit writable, so that the action body parser can deserialize it.
    */
-  def call[T](action: EssentialAction, req: FakeRequest[T])(implicit w: Writeable[T]): Future[Result] =
+  def call[T](action: EssentialAction, req: Request[T])(implicit w: Writeable[T], mat: Materializer): Future[Result] =
     call(action, req, req.body)
 
   /**
    * Execute an [[play.api.mvc.EssentialAction]].
    *
-   * The body is serialised using the implicit writable, so that the action body parser can deserialise it.
+   * The body is serialised using the implicit writable, so that the action body parser can deserialize it.
    */
-  def call[T](action: EssentialAction, rh: RequestHeader, body: T)(implicit w: Writeable[T]): Future[Result] = {
+  def call[T](action: EssentialAction, rh: RequestHeader, body: T)(implicit w: Writeable[T], mat: Materializer): Future[Result] = {
     import play.api.http.HeaderNames._
-    val newContentType = rh.headers.get(CONTENT_TYPE).fold(w.contentType)(_ => None)
-    val rhWithCt = newContentType.map { ct =>
-      rh.copy(headers = FakeHeaders((rh.headers.toMap + (CONTENT_TYPE -> Seq(ct))).toSeq))
-    }.getOrElse(rh)
+    val bytes = w.transform(body)
 
-    val requestBody = Enumerator(body) &> w.toEnumeratee
-    requestBody |>>> action(rhWithCt)
+    val contentType = rh.headers.get(CONTENT_TYPE).orElse(w.contentType).map(CONTENT_TYPE -> _)
+    val contentLength = rh.headers.get(CONTENT_LENGTH).orElse(Some(bytes.length.toString)).map(CONTENT_LENGTH -> _)
+    val newHeaders = rh.headers.replace(contentLength.toSeq ++ contentType.toSeq: _*)
+
+    action(rh.withHeaders(newHeaders)).run(Source.single(bytes))
   }
 }
 
@@ -216,61 +226,32 @@ trait RouteInvokers extends EssentialActionCaller {
   self: Writeables =>
 
   // Java compatibility
-  def jRoute(app: Application, rh: RequestHeader): Option[Future[Result]] = route(app, rh, AnyContentAsEmpty)
-  def jRoute(app: Application, rh: RequestHeader, body: Array[Byte]): Option[Future[Result]] = route(app, rh, body)(Writeable.wBytes)
-  def jRoute(rh: RequestHeader, body: Array[Byte]): Option[Future[Result]] = jRoute(Play.current, rh, body)
-  def jRoute[T](app: Application, r: FakeRequest[T]): Option[Future[Result]] = {
-    (r.body: @unchecked) match {
-      case body: AnyContentAsFormUrlEncoded => route(app, r, body)
-      case body: AnyContentAsJson => route(app, r, body)
-      case body: AnyContentAsXml => route(app, r, body)
-      case body: AnyContentAsText => route(app, r, body)
-      case body: AnyContentAsRaw => route(app, r, body)
-      case body: AnyContentAsEmpty.type => route(app, r, body)
-      //case _ => MatchError is thrown
-    }
+  def jRoute[T](app: Application, r: RequestHeader, body: RequestBody): Option[Future[Result]] = {
+    route(app, r, body.asBytes())
   }
 
   /**
-   * Use the Router to determine the Action to call for this request and execute it.
+   * Use the HttpRequestHandler to determine the Action to call for this request and execute it.
    *
-   * The body is serialised using the implicit writable, so that the action body parser can deserialise it.
+   * The body is serialised using the implicit writable, so that the action body parser can deserialize it.
    */
   def route[T](app: Application, rh: RequestHeader, body: T)(implicit w: Writeable[T]): Option[Future[Result]] = {
-    val handler = app.global.onRouteRequest(rh)
-    val taggedRh = handler.map({
-      case h: RequestTaggingHandler => h.tagRequest(rh)
-      case _ => rh
-    }).getOrElse(rh)
-    handler.flatMap {
+    val (taggedRh, handler) = app.requestHandler.handlerForRequest(rh)
+    import app.materializer
+    handler match {
       case a: EssentialAction =>
-        val filteredAction = app.global.doFilter(a)
-        Some(call(filteredAction, taggedRh, body))
-
+        Some(call(a, taggedRh, body))
       case _ => None
     }
   }
 
   /**
-   * Use the Router to determine the Action to call for this request and execute it.
+   * Use the HttpRequestHandler to determine the Action to call for this request and execute it.
    *
-   * The body is serialised using the implicit writable, so that the action body parser can deserialise it.
-   */
-  def route[T](rh: RequestHeader, body: T)(implicit w: Writeable[T]): Option[Future[Result]] = route(Play.current, rh, body)
-
-  /**
-   * Use the Router to determine the Action to call for this request and execute it.
-   *
-   * The body is serialised using the implicit writable, so that the action body parser can deserialise it.
+   * The body is serialised using the implicit writable, so that the action body parser can deserialize it.
    */
   def route[T](app: Application, req: Request[T])(implicit w: Writeable[T]): Option[Future[Result]] = route(app, req, req.body)
 
-  /**
-   * Use the Router to determine the Action to call for this request and execute it.
-   *
-   * The body is serialised using the implicit writable, so that the action body parser can deserialise it.
-   */
-  def route[T](req: Request[T])(implicit w: Writeable[T]): Option[Future[Result]] = route(Play.current, req)
 }
 
 trait ResultExtractors {
@@ -299,37 +280,67 @@ trait ResultExtractors {
   /**
    * Extracts the Content-Type of this Result value.
    */
-  def contentType(of: Future[Result])(implicit timeout: Timeout): Option[String] = header(CONTENT_TYPE, of).map(_.split(";").take(1).mkString.trim)
+  def contentType(of: Future[Result])(implicit timeout: Timeout): Option[String] = {
+    Await.result(of, timeout.duration).body.contentType.map(_.split(";").take(1).mkString.trim)
+  }
+
+  /**
+   * Extracts the Content-Type of this Result value.
+   */
+  def contentType(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Option[String] = {
+    contentType(of.run())
+  }
 
   /**
    * Extracts the Charset of this Result value.
    */
-  def charset(of: Future[Result])(implicit timeout: Timeout): Option[String] = header(CONTENT_TYPE, of) match {
-    case Some(s) if s.contains("charset=") => Some(s.split("; charset=").drop(1).mkString.trim)
-    case _ => None
+  def charset(of: Future[Result])(implicit timeout: Timeout): Option[String] = {
+    Await.result(of, timeout.duration).body.contentType match {
+      case Some(s) if s.contains("charset=") => Some(s.split("; *charset=").drop(1).mkString.trim)
+      case _ => None
+    }
+  }
+
+  /**
+   * Extracts the Charset of this Result value.
+   */
+  def charset(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Option[String] = {
+    charset(of.run())
   }
 
   /**
    * Extracts the content as String.
    */
-  def contentAsString(of: Future[Result])(implicit timeout: Timeout): String = new String(contentAsBytes(of), charset(of).getOrElse("utf-8"))
+  def contentAsString(of: Future[Result])(implicit timeout: Timeout, mat: Materializer = NoMaterializer): String =
+    contentAsBytes(of).decodeString(charset(of).getOrElse("utf-8"))
+
+  /**
+   * Extracts the content as String.
+   */
+  def contentAsString(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): String = contentAsString(of.run())
 
   /**
    * Extracts the content as bytes.
    */
-  def contentAsBytes(of: Future[Result])(implicit timeout: Timeout): Array[Byte] = {
+  def contentAsBytes(of: Future[Result])(implicit timeout: Timeout, mat: Materializer = NoMaterializer): ByteString = {
     val result = Await.result(of, timeout.duration)
-    val eBytes = result.header.headers.get(TRANSFER_ENCODING) match {
-      case Some("chunked") => result.body &> Results.dechunk
-      case _ => result.body
-    }
-    Await.result(eBytes |>>> Iteratee.consume[Array[Byte]](), timeout.duration)
+    Await.result(result.body.consumeData, timeout.duration)
   }
+
+  /**
+   * Extracts the content as bytes.
+   */
+  def contentAsBytes(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): ByteString = contentAsBytes(of.run())
 
   /**
    * Extracts the content as Json.
    */
-  def contentAsJson(of: Future[Result])(implicit timeout: Timeout): JsValue = Json.parse(contentAsString(of))
+  def contentAsJson(of: Future[Result])(implicit timeout: Timeout, mat: Materializer = NoMaterializer): JsValue = Json.parse(contentAsString(of))
+
+  /**
+   * Extracts the content as Json.
+   */
+  def contentAsJson(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): JsValue = contentAsJson(of.run())
 
   /**
    * Extracts the Status code of this Result value.
@@ -337,31 +348,64 @@ trait ResultExtractors {
   def status(of: Future[Result])(implicit timeout: Timeout): Int = Await.result(of, timeout.duration).header.status
 
   /**
-   * Extracts the Cookies of this Result value.
+   * Extracts the Status code of this Result value.
    */
-  def cookies(of: Future[Result])(implicit timeout: Timeout): Cookies = Cookies(header(SET_COOKIE, of))
+  def status(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Int = status(of.run())
 
   /**
-   * Extracts the Flash values of this Result value.
+   * Gets the Cookies associated with this Result value. Note that this only extracts the "new" cookies added to
+   * this result (e.g. through withCookies), not including the Session or Flash. The final set of cookies may be
+   * different because the Play server automatically adds those cookies and merges the headers.
    */
-  def flash(of: Future[Result])(implicit timeout: Timeout): Flash = Flash.decodeFromCookie(cookies(of).get(Flash.COOKIE_NAME))
+  def cookies(of: Future[Result])(implicit timeout: Timeout): Cookies = {
+    Await.result(of.map(result => Cookies(result.newCookies))(play.core.Execution.trampoline), timeout.duration)
+  }
 
   /**
-   * Extracts the Session of this Result value.
-   * Extracts the Session from this Result value.
+   * Extracts the Cookies set by this Result value.
    */
-  def session(of: Future[Result])(implicit timeout: Timeout): Session = Session.decodeFromCookie(cookies(of).get(Session.COOKIE_NAME))
+  def cookies(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Cookies = cookies(of.run())
+
+  /**
+   * Extracts the Flash values set by this Result value.
+   */
+  def flash(of: Future[Result])(implicit timeout: Timeout): Flash = {
+    Await.result(of.map(_.newFlash.getOrElse(Flash.emptyCookie))(play.core.Execution.trampoline), timeout.duration)
+  }
+
+  /**
+   * Extracts the Flash values set by this Result value.
+   */
+  def flash(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Flash = flash(of.run())
+
+  /**
+   * Extracts the Session values set by this Result value.
+   */
+  def session(of: Future[Result])(implicit timeout: Timeout): Session = {
+    Await.result(of.map(_.newSession.getOrElse(Session.emptyCookie))(play.core.Execution.trampoline), timeout.duration)
+  }
+
+  /**
+   * Extracts the Session set by this Result value.
+   */
+  def session(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Session = session(of.run())
 
   /**
    * Extracts the Location header of this Result value if this Result is a Redirect.
    */
   def redirectLocation(of: Future[Result])(implicit timeout: Timeout): Option[String] = Await.result(of, timeout.duration).header match {
-    case ResponseHeader(FOUND, headers) => headers.get(LOCATION)
-    case ResponseHeader(SEE_OTHER, headers) => headers.get(LOCATION)
-    case ResponseHeader(TEMPORARY_REDIRECT, headers) => headers.get(LOCATION)
-    case ResponseHeader(MOVED_PERMANENTLY, headers) => headers.get(LOCATION)
-    case ResponseHeader(_, _) => None
+    case ResponseHeader(FOUND, headers, _) => headers.get(LOCATION)
+    case ResponseHeader(SEE_OTHER, headers, _) => headers.get(LOCATION)
+    case ResponseHeader(TEMPORARY_REDIRECT, headers, _) => headers.get(LOCATION)
+    case ResponseHeader(MOVED_PERMANENTLY, headers, _) => headers.get(LOCATION)
+    case ResponseHeader(_, _, _) => None
   }
+
+  /**
+   * Extracts the Location header of this Result value if this Result is a Redirect.
+   */
+  def redirectLocation(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Option[String] =
+    redirectLocation(of.run())
 
   /**
    * Extracts an Header value of this Result value.
@@ -369,14 +413,28 @@ trait ResultExtractors {
   def header(header: String, of: Future[Result])(implicit timeout: Timeout): Option[String] = headers(of).get(header)
 
   /**
+   * Extracts an Header value of this Result value.
+   */
+  def header(header: String, of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Option[String] =
+    this.header(header, of.run())
+
+  /**
    * Extracts all Headers of this Result value.
    */
   def headers(of: Future[Result])(implicit timeout: Timeout): Map[String, String] = Await.result(of, timeout.duration).header.headers
+
+  /**
+   * Extracts all Headers of this Result value.
+   */
+  def headers(of: Accumulator[ByteString, Result])(implicit timeout: Timeout, mat: Materializer): Map[String, String] =
+    headers(of.run())
+
 }
 
 object Helpers extends PlayRunners
   with HeaderNames
   with Status
+  with MimeTypes
   with HttpProtocol
   with DefaultAwaitTimeout
   with ResultExtractors
@@ -384,3 +442,44 @@ object Helpers extends PlayRunners
   with EssentialActionCaller
   with RouteInvokers
   with FutureAwaits
+
+/**
+ * A trait declared on a class that contains an `def app: Application`, and can provide
+ * instances of a class.  Useful in integration tests.
+ */
+trait Injecting {
+  self: HasApp =>
+
+  /**
+   * Given an application, provides an instance from the application.
+   *
+   * @tparam T the type to return, using `app.injector.instanceOf`
+   * @return an instance of type T.
+   */
+  def inject[T: ClassTag]: T = {
+    self.app.injector.instanceOf
+  }
+}
+
+/**
+ * In 99% of cases, when running tests against the result body, you don't actually need a materializer since it's a
+ * strict body. So, rather than always requiring an implicit materializer, we use one if provided, otherwise we have
+ * a default one that simply throws an exception if used.
+ */
+private[play] object NoMaterializer extends Materializer {
+  override def withNamePrefix(name: String): Materializer =
+    throw new UnsupportedOperationException("NoMaterializer cannot be named")
+  override def materialize[Mat](runnable: Graph[ClosedShape, Mat]): Mat =
+    throw new UnsupportedOperationException("NoMaterializer cannot materialize")
+  override def materialize[Mat](runnable: Graph[ClosedShape, Mat], initialAttributes: Attributes): Mat =
+    throw new UnsupportedOperationException("NoMaterializer cannot materialize")
+
+  override def executionContext: ExecutionContextExecutor =
+    throw new UnsupportedOperationException("NoMaterializer does not provide an ExecutionContext")
+
+  def scheduleOnce(delay: FiniteDuration, task: Runnable): Cancellable =
+    throw new UnsupportedOperationException("NoMaterializer cannot schedule a single event")
+
+  def schedulePeriodically(initialDelay: FiniteDuration, interval: FiniteDuration, task: Runnable): Cancellable =
+    throw new UnsupportedOperationException("NoMaterializer cannot schedule a repeated event")
+}

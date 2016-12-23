@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.api.inject
 
@@ -13,7 +13,9 @@ import scala.reflect.ClassTag
  *
  * This abstraction is primarily provided for libraries that want to remain agnostic to the type of dependency
  * injection being used. End users are encouraged to use the facilities provided by the dependency injection framework
- * they are using directly, for example, if using Guice, use [[com.google.inject.Injector]] instead of this.
+ * they are using directly, for example, if using Guice, use [[http://google.github.io/guice/api-docs/latest/javadoc/index.html?com/google/inject/Injector.html com.google.inject.Injector]]
+ * instead of this.
+ *
  */
 trait Injector {
 
@@ -57,11 +59,18 @@ object NewInstanceInjector extends Injector {
 /**
  * A simple map backed injector.
  *
- * This injector is intended for use in the transitional period between when Play fully supports dependency injection
- * across the whole code base, and when some parts of Play still access core components through Play's global state.
+ * This injector is intended for use by compile time injected applications in the transitional period between when Play
+ * fully supports dependency injection across the whole code base, and when some parts of Play still access core
+ * components through Play's global state. Since Play's global state requires that some components are still dynamically
+ * looked up from an injector, when using a compile time DI approach, there is typically no way to dynamically look up
+ * components, so this provides a simple implementation of the [[Injector]] trait to allow components
+ * that Play requires to be dynamically looked up.
  *
  * It is intended to just hold built in Play components, but may be used to add additional components by end users when
  * required.
+ *
+ * The injector is an immutable structure, new components can be added using the `+` convenience method, which returns
+ * a new injector with that component included.
  *
  * @param fallback The injector to fallback to if no component can be found.
  * @param components The components that this injector provides.

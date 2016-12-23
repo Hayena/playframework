@@ -1,26 +1,33 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package javaguide.http;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import org.junit.*;
-import play.libs.Json;
-import play.test.WithApplication;
 import javaguide.testhelpers.MockJavaAction;
-
-import play.mvc.*;
-import play.mvc.Http.*;
+import org.junit.Test;
+import play.core.j.JavaContextComponents;
+import play.i18n.Langs;
+import play.i18n.MessagesApi;
+import play.libs.Json;
+import play.mvc.Http.Cookie;
+import play.mvc.Result;
+import play.test.WithApplication;
 
 import java.util.Map;
 
 import static javaguide.testhelpers.MockJavaActionHelper.*;
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.junit.Assert.assertThat;
 import static play.mvc.Controller.*;
-import static org.hamcrest.CoreMatchers.*;
-import static org.junit.Assert.*;
-import static play.test.Helpers.*;
+import static play.test.Helpers.fakeRequest;
 
 public class JavaResponse extends WithApplication {
+
+    JavaContextComponents contextComponents() {
+        return app.injector().instanceOf(JavaContextComponents.class);
+    }
 
     @Test
     public void textContentType() {
@@ -28,7 +35,7 @@ public class JavaResponse extends WithApplication {
         Result textResult = ok("Hello World!");
         //#text-content-type
 
-        assertThat(header("Content-Type", textResult), containsString("text/plain"));
+        assertThat(textResult.contentType().get(), containsString("text/plain"));
     }
 
     @Test
@@ -39,7 +46,7 @@ public class JavaResponse extends WithApplication {
         Result jsonResult = ok(json);
         //#json-content-type
 
-        assertThat(header("Content-Type", jsonResult), containsString("application/json"));
+        assertThat(jsonResult.contentType().get(), containsString("application/json"));
     }
 
     @Test
@@ -48,42 +55,32 @@ public class JavaResponse extends WithApplication {
         Result htmlResult = ok("<h1>Hello World!</h1>").as("text/html");
         //#custom-content-type
 
-        assertThat(header("Content-Type", htmlResult), containsString("text/html"));
-    }
-
-    @Test
-    public void contextContentType() {
-        assertThat(header("Content-Type", call(new MockJavaAction() {
-            //#context-content-type
-            public Result index() {
-                response().setContentType("text/html");
-                return ok("<h1>Hello World!</h1>");
-            }
-            //#context-content-type
-        }, fakeRequest())), containsString("text/html"));
+        assertThat(htmlResult.contentType().get(), containsString("text/html"));
     }
 
     @Test
     public void responseHeaders() {
-        Map<String, String> headers = headers(call(new MockJavaAction() {
+        Map<String, String> headers = call(new MockJavaAction() {
             //#response-headers
             public Result index() {
-                response().setContentType("text/html");
                 response().setHeader(CACHE_CONTROL, "max-age=3600");
                 response().setHeader(ETAG, "xxx");
-                return ok("<h1>Hello World!</h1>");
+                return ok("<h1>Hello World!</h1>").as("text/html");
             }
             //#response-headers
-        }, fakeRequest()));
+        }, fakeRequest(), mat).headers();
         assertThat(headers.get(CACHE_CONTROL), equalTo("max-age=3600"));
         assertThat(headers.get(ETAG), equalTo("xxx"));
     }
 
     @Test
     public void setCookie() {
-        setContext(fakeRequest());
+        setContext(fakeRequest(), contextComponents());
         //#set-cookie
-        response().setCookie("theme", "blue");
+        response().setCookie(new Cookie(
+            "theme", "blue",
+            null, null, null, false, false
+        ));
         //#set-cookie
         Cookie cookie = response().cookies().iterator().next();
         assertThat(cookie.name(), equalTo("theme"));
@@ -93,9 +90,9 @@ public class JavaResponse extends WithApplication {
 
     @Test
     public void detailedSetCookie() {
-        setContext(fakeRequest());
+        setContext(fakeRequest(), contextComponents());
         //#detailed-set-cookie
-        response().setCookie(
+        response().setCookie(new Cookie(
                 "theme",        // name
                 "blue",         // value
                 3600,           // maximum age
@@ -103,7 +100,7 @@ public class JavaResponse extends WithApplication {
                 ".example.com", // domain
                 false,          // secure
                 true            // http only
-        );
+        ));
         //#detailed-set-cookie
         Cookie cookie = response().cookies().iterator().next();
         assertThat(cookie.name(), equalTo("theme"));
@@ -118,7 +115,7 @@ public class JavaResponse extends WithApplication {
 
     @Test
     public void discardCookie() {
-        setContext(fakeRequest());
+        setContext(fakeRequest(), contextComponents());
         //#discard-cookie
         response().discardCookie("theme");
         //#discard-cookie
@@ -130,15 +127,14 @@ public class JavaResponse extends WithApplication {
 
     @Test
     public void charset() {
-        assertThat(header("Content-Type", call(new MockJavaAction() {
+        assertThat(call(new MockJavaAction() {
                     //#charset
                     public Result index() {
-                        response().setContentType("text/html; charset=iso-8859-1");
-                        return ok("<h1>Hello World!</h1>", "iso-8859-1");
+                        return ok("<h1>Hello World!</h1>", "iso-8859-1").as("text/html; charset=iso-8859-1");
                     }
                     //#charset
-                }, fakeRequest())),
-                equalTo("text/html; charset=iso-8859-1"));
+                }, fakeRequest(), mat).charset().get(),
+                equalTo("iso-8859-1"));
     }
 
 }

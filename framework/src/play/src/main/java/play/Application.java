@@ -1,132 +1,125 @@
 /*
- * Copyright (C) 2009-2013 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play;
 
-import java.io.*;
-import java.util.*;
-import java.net.*;
+import java.io.File;
+import java.io.InputStream;
+import java.net.URL;
 
+import com.typesafe.config.Config;
 import play.inject.Injector;
 import play.libs.Scala;
 
-import javax.inject.Inject;
-import javax.inject.Singleton;
-
 /**
  * A Play application.
- * <p>
+ *
  * Application creation is handled by the framework engine.
  */
-@Singleton
-public class Application {
-    
-    private final play.api.Application application;
-    private final Injector injector;
-
-    public play.api.Application getWrappedApplication() {
-      return application;
-    }
+public interface Application {
 
     /**
-     * Creates an application from a Scala Application value.
+     * Get the underlying Scala application.
+     *
+     * @return the application
      */
-    @Inject
-    public Application(play.api.Application application, Injector injector) {
-        this.application = application;
-        this.injector = injector;
-    }
-    
+    play.api.Application getWrappedApplication();
+
     /**
-     * Retrieves the application path.
-     * <p>
+     * Get the application configuration.
+     *
+     * @return the configuration
+     */
+    @Deprecated
+    default Configuration configuration() {
+        return new Configuration(this.config());
+    }
+
+    /**
+     * Get the application configuration.
+     *
+     * @return the configuration
+     */
+    Config config();
+
+    /**
+     * Get the injector for this application.
+     *
+     * @return the injector
+     */
+    Injector injector();
+
+    /**
+     * Get the application path.
+     *
      * @return the application path
      */
-    public File path() {
-        return application.path();
+    default File path() {
+        return getWrappedApplication().path();
     }
-    
+
     /**
-     * Retrieves the application configuration/
-     * <p>
-     * @return the application path
-     */
-    public Configuration configuration() {
-        return new Configuration(application.configuration());
-    }
-    
-    /**
-     * Retrieves the application classloader.
-     * <p>
+     * Get the application classloader.
+     *
      * @return the application classloader
      */
-    public ClassLoader classloader() {
-        return application.classloader();
+    default ClassLoader classloader() {
+        return getWrappedApplication().classloader();
     }
-    
+
     /**
-     * Retrieves a file relative to the application root path.
+     * Get a file relative to the application root path.
      *
      * @param relativePath relative path of the file to fetch
      * @return a file instance - it is not guaranteed that the file exists
      */
-    public File getFile(String relativePath) {
-        return application.getFile(relativePath);
+    default File getFile(String relativePath) {
+        return getWrappedApplication().getFile(relativePath);
     }
-    
+
     /**
-     * Retrieves a resource from the classpath.
+     * Get a resource from the classpath.
      *
      * @param relativePath relative path of the resource to fetch
      * @return URL to the resource (may be null)
      */
-    public URL resource(String relativePath) {
-        return Scala.orNull(application.resource(relativePath));
+    default URL resource(String relativePath) {
+        return Scala.orNull(getWrappedApplication().resource(relativePath));
     }
-    
+
     /**
-     * Retrieves a resource stream from the classpath.
+     * Get a resource stream from the classpath.
      *
      * @param relativePath relative path of the resource to fetch
      * @return InputStream to the resource (may be null)
      */
-    public InputStream resourceAsStream(String relativePath) {
-        return Scala.orNull(application.resourceAsStream(relativePath));
-    }
-    
-    /**
-     * Retrieve the plugin instance for the class.
-     */
-    public <T> T plugin(Class<T> pluginClass) {
-        return Scala.orNull(application.plugin(pluginClass));
-    }
-    
-    /**
-     * Returns `true` if the application is `DEV` mode.
-     */
-    public boolean isDev() {
-        return play.api.Play.isDev(application);
-    }
-    
-    /**
-     * Returns `true` if the application is `PROD` mode.
-     */
-    public boolean isProd() {
-        return play.api.Play.isProd(application);
-    }
-    
-    /**
-     * Returns `true` if the application is `TEST` mode.
-     */
-    public boolean isTest() {
-        return play.api.Play.isTest(application);
+    default InputStream resourceAsStream(String relativePath) {
+        return Scala.orNull(getWrappedApplication().resourceAsStream(relativePath));
     }
 
     /**
-     * Get the injector for this application.
+     * Check whether the application is in {@link Mode#DEV} mode.
+     *
+     * @return true if the application is in DEV mode
      */
-    public Injector injector() {
-        return injector;
+    default boolean isDev() { return getWrappedApplication().isDev(); }
+
+    /**
+     * Check whether the application is in {@link Mode#PROD} mode.
+     *
+     * @return true if the application is in PROD mode
+     */
+    default boolean isProd() {
+        return getWrappedApplication().isProd();
+    }
+
+    /**
+     * Check whether the application is in {@link Mode#TEST} mode.
+     *
+     * @return true if the application is in TEST mode
+     */
+    default boolean isTest() {
+        return getWrappedApplication().isTest();
     }
 
 }

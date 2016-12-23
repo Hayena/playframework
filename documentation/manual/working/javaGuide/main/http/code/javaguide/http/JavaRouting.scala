@@ -1,21 +1,22 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package javaguide.http
 
+import java.util.concurrent.CompletableFuture
+
+import play.api.Application
+import akka.stream.ActorMaterializer
 import org.specs2.mutable.Specification
-import play.api.mvc.{Result, Handler, EssentialAction, RequestHeader}
-import play.core.Router
+import play.api.mvc.{EssentialAction, RequestHeader}
+import play.api.routing.Router
 import javaguide.http.routing._
 import play.api.test.Helpers._
-import play.api.test.{FakeRequest, FakeApplication}
+import play.api.test.FakeRequest
 import javaguide.testhelpers.MockJavaAction
-import play.core.j.{JavaHandlerComponents, JavaHandler}
 import play.libs.F
 
-import scala.concurrent.Future
-
-object JavaRouting extends Specification {
+class JavaRouting extends Specification {
 
   "the java router" should {
     "support simple routing with a long parameter" in {
@@ -47,28 +48,46 @@ object JavaRouting extends Specification {
       contentOf(FakeRequest("GET", "/clients"), classOf[defaultvalue.Routes]) must_== "clients page 1"
       contentOf(FakeRequest("GET", "/clients?page=2"), classOf[defaultvalue.Routes]) must_== "clients page 2"
     }
+    "support invoking Default controller actions" in {
+      statusOf(FakeRequest("GET", "/about"), classOf[defaultcontroller.Routes]) must_== SEE_OTHER
+      statusOf(FakeRequest("GET", "/orders"), classOf[defaultcontroller.Routes]) must_== NOT_FOUND
+      statusOf(FakeRequest("GET", "/clients"), classOf[defaultcontroller.Routes]) must_== INTERNAL_SERVER_ERROR
+      statusOf(FakeRequest("GET", "/posts"), classOf[defaultcontroller.Routes]) must_== NOT_IMPLEMENTED
+    }
     "support optional values for parameters" in {
       contentOf(FakeRequest("GET", "/api/list-all")) must_== "version null"
       contentOf(FakeRequest("GET", "/api/list-all?version=3.0")) must_== "version 3.0"
     }
     "support reverse routing" in {
-      running(FakeApplication()) {
+      running() { app =>
+        implicit val mat = ActorMaterializer()(app.actorSystem)
         header("Location", call(new MockJavaAction {
-          override def invocation = F.Promise.pure(new javaguide.http.routing.controllers.Application().index())
+          override def invocation = CompletableFuture.completedFuture(new javaguide.http.routing.controllers.Application().index())
         }, FakeRequest())) must beSome("/hello/Bob")
       }
     }
 
   }
 
-  def contentOf(rh: RequestHeader, router: Class[_ <: Router.Routes] = classOf[Routes]) = {
-    val app = FakeApplication(additionalConfiguration = Map("application.router" -> router.getName))
-    running(app) {
+  def contentOf(rh: RequestHeader, router: Class[_ <: Router] = classOf[Routes]) = {
+    running(_.configure("play.http.router" -> router.getName)) { app =>
+      implicit val mat = ActorMaterializer()(app.actorSystem)
       contentAsString(app.requestHandler.handlerForRequest(rh)._2 match {
-        case e: EssentialAction => e(rh).run
+        case e: EssentialAction => e(rh).run()
       })
     }
   }
+
+
+  def statusOf(rh: RequestHeader, router: Class[_ <: Router] = classOf[Routes]) = {
+    running(_.configure("play.http.router" -> router.getName)) { app =>
+      implicit val mat = ActorMaterializer()(app.actorSystem)
+      status(app.requestHandler.handlerForRequest(rh)._2 match {
+        case e: EssentialAction => e(rh).run()
+      })
+    }
+  }
+
 }
 
 package routing.query.controllers {
@@ -104,3 +123,6 @@ class Clients extends Controller {
 }
 }
 
+package routing.defaultcontroller.controllers {
+class Default extends _root_.controllers.Default
+}

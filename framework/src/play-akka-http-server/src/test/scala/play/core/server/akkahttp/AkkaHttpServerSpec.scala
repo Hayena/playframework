@@ -1,27 +1,30 @@
+/*
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
+ */
 package play.core.server.akkahttp
 
-import play.api.http.HeaderNames._
-import play.api.libs.iteratee._
+import play.api.inject.guice.GuiceApplicationBuilder
 import play.api.libs.ws._
 import play.api.mvc._
 import play.api.mvc.BodyParsers.parse
 import play.api.mvc.Results._
 import play.api.test._
-import play.core.server.ServerProvider
 import scala.concurrent.Future
-import scala.concurrent.duration._
 import akka.util.Timeout
 
-object AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
-  skipAllIf(true) // Disable all tests until issues in Continuous Integration are resolved
+class AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
+  // Provide a flag to disable Akka HTTP tests
+  private val runTests: Boolean = (System.getProperty("run.akka.http.tests", "true") == "true")
+  skipAllIf(!runTests)
 
   sequential
 
-  def requestFromServer[T](path: String)(exec: WSRequestHolder => Future[WSResponse])(routes: PartialFunction[(String, String), Handler])(check: WSResponse => T): T = {
-    running(TestServer(testServerPort, FakeApplication(withRoutes = routes), serverProvider = AkkaHttpServer.defaultServerProvider)) {
+  def requestFromServer[T](path: String)(exec: WSRequest => Future[WSResponse])(routes: PartialFunction[(String, String), Handler])(check: WSResponse => T)(implicit awaitTimeout: Timeout): T = {
+    val app = GuiceApplicationBuilder().routes(routes).build()
+    running(TestServer(testServerPort, app, serverProvider = Some(AkkaHttpServer.provider))) {
       val plainRequest = wsUrl(path)(testServerPort)
       val responseFuture = exec(plainRequest)
-      val response = await(responseFuture)
+      val response = await(responseFuture)(awaitTimeout)
       check(response)
     }
   }
@@ -29,25 +32,27 @@ object AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
   "AkkaHttpServer" should {
 
     "send hello world" in {
+      // This test experiences CI timeouts. Give it more time.
+      val reallyLongTimeout = Timeout(defaultAwaitTimeout.duration * 3)
       requestFromServer("/hello") { request =>
         request.get()
       } {
         case ("GET", "/hello") => Action(Ok("greetings"))
       } { response =>
         response.body must_== "greetings"
-      }
+      }(reallyLongTimeout)
     }
 
-    "send chunked responses when missing a Content-Length (TODO: automatically dechunk for some responses)" in {
+    "send responses when missing a Content-Length" in {
       requestFromServer("/hello") { request =>
         request.get()
       } {
         case ("GET", "/hello") => Action(Ok("greetings"))
       } { response =>
         response.status must_== 200
-        response.header(TRANSFER_ENCODING) must_== Some("chunked")
-        response.header(CONTENT_TYPE) must_== Some("text/plain; charset=UTF-8")
-        response.header(CONTENT_LENGTH) must_== None
+        response.header(CONTENT_TYPE) must_== Some("text/plain; charset=utf-8")
+        response.header(CONTENT_LENGTH) must_== Some("9")
+        response.header(TRANSFER_ENCODING) must_== None
         response.body must_== "greetings"
       }
     }
@@ -61,7 +66,7 @@ object AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
         }
       } { response =>
         response.status must_== 200
-        response.header(CONTENT_TYPE) must_== Some("text/plain; charset=UTF-8")
+        response.header(CONTENT_TYPE) must_== Some("text/plain; charset=utf-8")
         response.header(CONTENT_LENGTH) must_== Some("9")
         response.header(TRANSFER_ENCODING) must_== None
         response.body must_== "greetings"
@@ -91,6 +96,40 @@ object AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
       }
     }
 
+    "pass raw request URI to Actions" in {
+      requestFromServer("/abc?foo=bar") { request =>
+        request.withHeaders(
+          ACCEPT_ENCODING -> "utf-8",
+          ACCEPT_LANGUAGE -> "en-US"
+        ).get()
+      } {
+        case ("GET", "/abc") => Action { implicit request =>
+          Ok(request.uri)
+        }
+      } { response =>
+        response.status must_== 200
+        response.body must_== "/abc?foo=bar"
+      }
+    }
+
+    "pass raw request uri to Actions even if Raw-Request-URI header is set" in {
+      import akka.http.scaladsl.model.headers._
+      requestFromServer("/abc?foo=bar") { request =>
+        request.withHeaders(
+          ACCEPT_ENCODING -> "utf-8",
+          ACCEPT_LANGUAGE -> "en-US",
+          `Raw-Request-URI`.name -> "/foo/bar/baz"
+        ).get()
+      } {
+        case ("GET", "/abc") => Action { implicit request =>
+          Ok(request.uri)
+        }
+      } { response =>
+        response.status must_== 200
+        response.body must_== "/abc?foo=bar"
+      }
+    }
+
     "pass POST request bodies to Actions" in {
       requestFromServer("/greet") { request =>
         request.post("Bob")
@@ -105,7 +144,7 @@ object AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
       }
     }
 
-    "send response statii" in {
+    "send response statüs" in {
       requestFromServer("/def") { request =>
         request.get()
       } {
@@ -139,11 +178,32 @@ object AkkaHttpServerSpec extends PlaySpecification with WsTestClient {
     }
 
     "support WithServer form" in new WithServer(
-      app = FakeApplication(withRoutes = httpServerTagRoutes),
-      serverProvider = AkkaHttpServer.defaultServerProvider) {
+      app = GuiceApplicationBuilder().routes(httpServerTagRoutes).build(),
+      serverProvider = Some(AkkaHttpServer.provider)) {
       val response = await(wsUrl("/httpServerTag").get())
       response.status must equalTo(OK)
       response.body must_== "Some(akka-http)"
+    }
+
+    "start and stop cleanly" in {
+      PlayRunners.mutex.synchronized {
+        def testStartAndStop(i: Int) = {
+          val resultString = s"result-$i"
+          val app = GuiceApplicationBuilder().routes {
+            case ("GET", "/") => Action(Ok(resultString))
+          }.build()
+          val server = TestServer(testServerPort, app, serverProvider = Some(AkkaHttpServer.provider))
+          server.start()
+          try {
+            val response = await(wsUrl("/")(testServerPort).get())
+            response.body must_== resultString
+          } finally {
+            server.stop()
+          }
+        }
+        // Start and stop the server 20 times
+        (0 until 20) must contain { (i: Int) => testStartAndStop(i) }
+      }
     }
 
   }

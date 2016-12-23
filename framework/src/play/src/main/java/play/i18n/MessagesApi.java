@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.i18n;
 
 import org.apache.commons.lang3.ArrayUtils;
 import play.mvc.Http;
-import scala.collection.JavaConversions;
+import scala.collection.JavaConverters;
 import scala.collection.Seq;
 import scala.collection.mutable.Buffer;
 
@@ -14,7 +14,6 @@ import javax.inject.Singleton;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * The messages API.
@@ -23,6 +22,10 @@ import java.util.Locale;
 public class MessagesApi {
 
     private final play.api.i18n.MessagesApi messages;
+
+    public play.api.i18n.MessagesApi scalaApi() {
+        return messages;
+    }
 
     @Inject
     public MessagesApi(play.api.i18n.MessagesApi messages) {
@@ -47,6 +50,7 @@ public class MessagesApi {
      * Otherwise, it calls Arrays.asList on args
      * @param args arguments as a List
      */
+    @SafeVarargs
     private static <T> List<T> wrapArgsToListIfNeeded(final T... args) {
         List<T> out;
         if (ArrayUtils.isNotEmpty(args)
@@ -106,23 +110,41 @@ public class MessagesApi {
      *
      * Will select a language from the candidates, based on the languages available, and fallback to the default language
      * if none of the candidates are available.
+     *
+     * @param candidates the candidate languages
+     * @return the most appropriate Messages instance given the candidate languages
      */
     public Messages preferred(Collection<Lang> candidates) {
-        Seq<Lang> cs = JavaConversions.collectionAsScalaIterable(candidates).toSeq();
+        Seq<Lang> cs = JavaConverters.collectionAsScalaIterable(candidates).toSeq();
         play.api.i18n.Messages msgs = messages.preferred((Seq) cs);
-        return new Messages(new Lang(msgs.lang()), this);
+        return new MessagesImpl(new Lang(msgs.lang()), this);
     }
 
 
     /**
-     * Get a messages context appropriate for the given candidates.
+     * Get a messages context appropriate for the given request.
      *
-     * Will select a language from the candidates, based on the languages available, and fallback to the default language
+     * Will select a language from the request, based on the languages available, and fallback to the default language
      * if none of the candidates are available.
+     *
+     * @param request the incoming request
+     * @return the preferred messages context for the request
      */
     public Messages preferred(Http.RequestHeader request) {
         play.api.i18n.Messages msgs = messages.preferred(request);
-        return new Messages(new Lang(msgs.lang()), this);
+        return new MessagesImpl(new Lang(msgs.lang()), this);
+    }
+
+    public String langCookieName() {
+        return messages.langCookieName();
+    }
+
+    public boolean langCookieSecure() {
+        return messages.langCookieSecure();
+    }
+
+    public boolean langCookieHttpOnly() {
+        return messages.langCookieHttpOnly();
     }
 
 }

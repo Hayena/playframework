@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.db;
 
@@ -7,7 +7,9 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.sql.DataSource;
 
-import play.Configuration;
+import com.typesafe.config.Config;
+import play.Environment;
+import play.api.db.DatabaseConfig;
 
 /**
  * Default delegating implementation of the connection pool API.
@@ -22,8 +24,8 @@ public class DefaultConnectionPool implements ConnectionPool {
         this.cp = connectionPool;
     }
 
-    public DataSource create(String name, Configuration configuration, ClassLoader classLoader) {
-        return cp.create(name, configuration.getWrappedConfiguration(), classLoader);
+    public DataSource create(String name, Config config, Environment environment) {
+        return cp.create(name, DatabaseConfig.fromConfig(new play.api.Configuration(config), environment.underlying()), config);
     }
 
     public void close(DataSource dataSource) {

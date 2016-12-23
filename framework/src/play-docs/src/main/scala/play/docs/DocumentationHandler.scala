@@ -1,25 +1,41 @@
 /*
- * Copyright (C) 2009-2013 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.docs
 
+import java.io.Closeable
+
+import akka.stream.scaladsl.StreamConverters
+import play.api.http._
 import play.api.mvc._
-import play.api.http.Status
-import play.api.http.HeaderNames
-import play.api.libs.iteratee.Enumerator
-import play.api.libs.iteratee.Enumeratee
-import play.core.{ PlayVersion, BuildDocHandler }
-import play.doc.{ FileRepository, PlayDoc, RenderedPage, PageIndex }
-import org.apache.commons.io.IOUtils
+import play.core.{ BuildDocHandler, PlayVersion }
+import play.doc.{ FileRepository, PageIndex, PlayDoc, RenderedPage }
 
 /**
  * Used by the DocumentationApplication class to handle requests for Play documentation.
  * Documentation is located in the given repository - either a JAR file or directly from
  * the filesystem.
  */
-class DocumentationHandler(repo: FileRepository, apiRepo: FileRepository) extends BuildDocHandler {
+class DocumentationHandler(repo: FileRepository, apiRepo: FileRepository, toClose: Closeable) extends BuildDocHandler with Closeable {
 
+  def this(repo: FileRepository, toClose: Closeable) = this(repo, repo, toClose)
+  def this(repo: FileRepository, apiRepo: FileRepository) = this(repo, apiRepo, new Closeable() { def close() = () })
   def this(repo: FileRepository) = this(repo, repo)
+
+  private val fileMimeTypes: FileMimeTypes = {
+    new FileMimeTypes {
+      override def forFileName(name: String): Option[String] = name match {
+        case "html" => Some("text/html")
+        case "css" => Some("text/css")
+        case "png" => Some("image/png")
+        case "js" => Some("application/javascript")
+        case "ico" => Some("application/javascript")
+        case "jpg" => Some("image/jpeg")
+        case "ico" => Some("ico=image/x-icon")
+        case _ => None
+      }
+    }
+  }
 
   /**
    * This is a def because we want to reindex the docs each time.
@@ -45,15 +61,12 @@ class DocumentationHandler(repo: FileRepository, apiRepo: FileRepository) extend
 
     // Assumes caller consumes result, closing entry
     def sendFileInline(repo: FileRepository, path: String): Option[Result] = {
-      import play.api.libs.concurrent.Execution.Implicits.defaultContext
       repo.handleFile(path) { handle =>
-        Result(
-          ResponseHeader(Status.OK, Map(
-            HeaderNames.CONTENT_LENGTH -> handle.size.toString,
-            HeaderNames.CONTENT_TYPE -> play.api.libs.MimeTypes.forFileName(handle.name).getOrElse(play.api.http.ContentTypes.BINARY)
-          )),
-          Enumerator.fromStream(handle.is) &> Enumeratee.onIterateeDone(handle.close)
-        )
+        Results.Ok.sendEntity(HttpEntity.Streamed(
+          StreamConverters.fromInputStream(() => handle.is).mapMaterializedValue(_ => handle.close),
+          Some(handle.size),
+          fileMimeTypes.forFileName(handle.name).orElse(Some(ContentTypes.BINARY))
+        ))
       }
     }
 
@@ -78,13 +91,15 @@ class DocumentationHandler(repo: FileRepository, apiRepo: FileRepository) extend
       case wikiPage(page) => Some(
         playDoc.renderPage(page) match {
           case None => NotFound(views.html.play20.manual(page, None, None, locator))
-          case Some(RenderedPage(mainPage, None, _)) => Ok(views.html.play20.manual(page, Some(mainPage), None, locator))
-          case Some(RenderedPage(mainPage, Some(sidebar), _)) => Ok(views.html.play20.manual(page, Some(mainPage), Some(sidebar), locator))
+          case Some(RenderedPage(mainPage, None, _, _)) => Ok(views.html.play20.manual(page, Some(mainPage), None, locator))
+          case Some(RenderedPage(mainPage, Some(sidebar), _, _)) => Ok(views.html.play20.manual(page, Some(mainPage), Some(sidebar), locator))
         }
       )
       case _ => None
     }
   }
+
+  def close() = toClose.close()
 }
 
 /**

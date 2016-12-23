@@ -1,33 +1,29 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.db;
 
-import java.util.Set;
-import javax.inject.Inject;
-import javax.inject.Provider;
-
-import scala.collection.Seq;
-
+import com.google.common.collect.ImmutableList;
 import play.api.Configuration;
 import play.api.Environment;
 import play.api.inject.Binding;
 import play.api.inject.Module;
-import play.db.NamedDatabase;
-import play.db.NamedDatabaseImpl;
 import play.libs.Scala;
+import scala.collection.Seq;
 
-import com.google.common.collect.ImmutableList;
+import javax.inject.Inject;
+import javax.inject.Provider;
+import java.util.Set;
 
 /**
  * Injection module with default DB components.
  */
-public class DBModule extends Module {
+public final class DBModule extends Module {
 
     @Override
     public Seq<Binding<?>> bindings(Environment environment, Configuration configuration) {
-        String dbKey = configuration.underlying().getString("play.modules.db.config");
-        String defaultDb = configuration.underlying().getString("play.modules.db.default");
+        String dbKey = configuration.underlying().getString("play.db.config");
+        String defaultDb = configuration.underlying().getString("play.db.default");
 
         ImmutableList.Builder<Binding<?>> list = new ImmutableList.Builder<Binding<?>>();
 

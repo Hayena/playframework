@@ -1,7 +1,9 @@
 /*
- * Copyright (C) 2009-2014 Typesafe Inc. <http://www.typesafe.com>
+ * Copyright (C) 2009-2016 Lightbend Inc. <https://www.lightbend.com>
  */
 package play.inject;
+
+import play.api.inject.BindingKey;
 
 /**
  * An injector, capable of providing components.
@@ -18,8 +20,18 @@ public interface Injector {
     /**
      * Get an instance of the given class from the injector.
      *
+     * @param <T> the type of the instance
      * @param clazz The class to get the instance of
      * @return The instance
      */
     <T> T instanceOf(Class<T> clazz);
+
+    /**
+     * Get an instance of the given class from the injector.
+     *
+     * @param <T> the type of the instance
+     * @param key The key of the binding
+     * @return The instance
+     */
+    <T> T instanceOf(BindingKey<T> key);
 }
